@@ -64,7 +64,9 @@ jobs:
         id: build
         env:
           SOURCE_S3_BASE: ${{ secrets.SOURCE_S3_BASE }}
-          DUCKDB_THREADS: "2"
+          DUCKDB_THREADS: "4"            # ephemeral runner — use all cores
+          DUCKDB_MEMORY_LIMIT: "13GB"    # cap under the 16GB runner; spill to disk
+          DUCKDB_TEMP_DIR: "/tmp/duckspill"
         run: python daily_archive.py --date "${{ steps.date.outputs.date }}" --out-dir dist
 
       - name: Mirror to own storage (resilience — independent of GitHub)
