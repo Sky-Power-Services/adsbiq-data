@@ -103,6 +103,10 @@ def build(date: str, source_base: str, region: str, out_dir: str) -> dict:
     if tmp:
         os.makedirs(tmp, exist_ok=True)
         con.execute(f"PRAGMA temp_directory='{tmp}'")
+    # Let the big sorted COPY stream/spill instead of buffering the whole result to
+    # preserve incidental row order — our explicit ORDER BY still sorts the output.
+    # This is the documented fix for the COPY OOM on large days.
+    con.execute("SET preserve_insertion_order=false")
     # Pull creds from the standard AWS chain (env vars / OIDC / instance role).
     con.execute("CREATE SECRET aws (TYPE S3, PROVIDER credential_chain);")
 
