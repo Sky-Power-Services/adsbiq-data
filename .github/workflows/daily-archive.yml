@@ -1,0 +1,94 @@
+# ADSBiq daily history archiver.
+#
+# Place this file at  .github/workflows/daily-archive.yml  in the PUBLIC data
+# repo. It runs on GitHub's runners — never on the prod box — so the real-time
+# decoders are untouched. Public repos get unlimited free Actions minutes, and
+# GitHub Releases host the assets free, indefinitely.
+#
+# One-time setup (private notes): create the repo, an AWS IAM role/keys with
+# read-only access to the source lake, and configure these in repo settings:
+#   secret  SOURCE_S3_BASE  — the partition root the archiver reads
+#   secret  AWS_ROLE_ARN    — OIDC role to assume (read-only)
+#   var     DAILY_S3_DEST   — optional: also mirror the file to your own storage
+# No source locations are committed to this public repo.
+
+name: daily-archive
+
+on:
+  schedule:
+    # 06:10 UTC — comfortably after the previous UTC day has fully flushed
+    # (15-min flush cadence + margin).
+    - cron: "10 6 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Specific UTC day to (re)archive, YYYY-MM-DD. Blank = yesterday."
+        required: false
+        default: ""
+
+permissions:
+  contents: write        # create releases / upload assets
+  id-token: write        # request the GitHub OIDC token for AWS auth
+
+concurrency:
+  group: daily-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS (OIDC, read-only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Resolve target date
+        id: date
+        run: |
+          D="${{ github.event.inputs.date }}"
+          [ -z "$D" ] && D="$(date -u -d 'yesterday' +%F)"
+          echo "date=$D" >> "$GITHUB_OUTPUT"
+
+      - name: Build daily archive
+        id: build
+        env:
+          SOURCE_S3_BASE: ${{ secrets.SOURCE_S3_BASE }}
+          DUCKDB_THREADS: "2"
+        run: python daily_archive.py --date "${{ steps.date.outputs.date }}" --out-dir dist
+
+      - name: Mirror to own storage (resilience — independent of GitHub)
+        # Writes the same daily file to your own storage at vars.DAILY_S3_DEST.
+        # The OIDC role needs PutObject on that prefix. Skipped if the var is unset.
+        if: vars.DAILY_S3_DEST != ''
+        run: |
+          DEST="${{ vars.DAILY_S3_DEST }}/$(date -u -d '${{ steps.date.outputs.date }}' +%Y)"
+          aws s3 cp "${{ steps.build.outputs.parquet }}"  "$DEST/" --only-show-errors
+          aws s3 cp "${{ steps.build.outputs.manifest }}" "$DEST/" --only-show-errors
+          echo "Mirrored to $DEST/"
+
+      - name: Publish or overwrite GitHub Release
+        # Overwrite (clobber) on rerun so a partial same-day "stub" release is
+        # replaced by the full day's data when the scheduled run lands.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          D="${{ steps.date.outputs.date }}"
+          TITLE="ADSBiq aircraft diffs — $D"
+          NOTES="Daily ADS-B aircraft state diffs for $D (${{ steps.build.outputs.rows }} rows). zstd Parquet. ODbL-1.0. See README for schema."
+          if gh release view "$D" >/dev/null 2>&1; then
+            gh release upload "$D" "${{ steps.build.outputs.parquet }}" "${{ steps.build.outputs.manifest }}" --clobber
+            gh release edit "$D" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$D" "${{ steps.build.outputs.parquet }}" "${{ steps.build.outputs.manifest }}" --title "$TITLE" --notes "$NOTES"
+          fi
