@@ -20,6 +20,18 @@ small):
 
 To reconstruct full state at any time, forward-fill per `hex` ordered by `ts`.
 
+## Resolution — adaptive trace thinning
+Rows are **adaptively thinned** (adsb.lol trace style), not raw 1 Hz. A point is
+kept when the aircraft *does something* — a heading change ≥ 5°, an altitude change
+≥ 80 ft, or a state change (squawk/callsign/snapshot/removal) — plus a **30 s
+heartbeat** so straight cruise still has a point at least every 30 s. The result:
+turns and climbs keep full detail, while redundant cruise points are dropped
+(~10× smaller files). The exact thresholds are recorded in each `manifest.json`
+under `thinning`, with `raw_points` vs kept `rows`.
+
+Files are sorted by `(hex, ts)`. `lat`/`lon` are degrees; `alt_*`/`gs`/`ias`/`tas`
+and the rate fields are integers.
+
 ### Key columns
 `ts` (UTC timestamp), `date`, `is_snapshot`, `is_removed`, `hex` (ICAO 24-bit),
 `src`, `flight`, `lat`, `lon`, `alt_baro`, `alt_geom`, `gs`, `track`, `squawk`,
