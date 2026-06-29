@@ -15,10 +15,11 @@
 name: daily-archive
 
 on:
-  schedule:
-    # 06:10 UTC — comfortably after the previous UTC day has fully flushed
-    # (15-min flush cadence + margin).
-    - cron: "10 6 * * *"
+  # Scheduled run DISABLED — the daily ADS-B build now runs in-region on a
+  # self-terminating spot box (milepost1 `adsbiq-archive.timer`, 06:10 UTC):
+  # free S3 read + no RAM ceiling. This workflow stays as a manual fallback.
+  # schedule:
+  #   - cron: "10 6 * * *"
   workflow_dispatch:
     inputs:
       date:
