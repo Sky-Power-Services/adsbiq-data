@@ -41,6 +41,17 @@ import os
 import sys
 
 
+# Adaptive-thinning thresholds (adsb.lol trace style). Env-overridable.
+# A point is kept on a real maneuver OR a heartbeat OR a state change, so straight
+# cruise collapses to one point per heartbeat while turns/climbs stay full-detail.
+_THIN_HEARTBEAT_S = int(os.environ.get("THIN_HEARTBEAT_S", "30"))   # min one point / aircraft / Ns
+_THIN_TURN_DEG    = float(os.environ.get("THIN_TURN_DEG", "5"))     # keep if heading moved >= this
+_THIN_VERT_FT     = int(os.environ.get("THIN_VERT_FT", "80"))       # keep if altitude moved >= this
+# Columns that are integers by nature but may be stored as float — cast to INT
+# (smaller + more correct; lat/lon stay as degrees for consumer friendliness).
+_INT_FIELDS = {"alt_baro", "alt_geom", "gs", "ias", "tas", "baro_rate", "geom_rate"}
+
+
 def _yesterday_utc() -> str:
     return (_dt.datetime.now(_dt.timezone.utc).date() - _dt.timedelta(days=1)).isoformat()
 
@@ -82,27 +93,75 @@ def build(date: str, source_base: str, region: str, out_dir: str) -> dict:
     threads = os.environ.get("DUCKDB_THREADS")
     if threads:
         con.execute(f"PRAGMA threads={int(threads)};")
+    # Memory safety: the adaptive-thinning windows materialize a lot, so cap RAM
+    # and give DuckDB a disk temp dir to spill into. Keeps a small runner from
+    # OOMing on a big day (prime directive). Defaults left to DuckDB if unset.
+    mem = os.environ.get("DUCKDB_MEMORY_LIMIT")
+    if mem:
+        con.execute(f"PRAGMA memory_limit='{mem}'")
+    tmp = os.environ.get("DUCKDB_TEMP_DIR")
+    if tmp:
+        os.makedirs(tmp, exist_ok=True)
+        con.execute(f"PRAGMA temp_directory='{tmp}'")
     # Pull creds from the standard AWS chain (env vars / OIDC / instance role).
     con.execute("CREATE SECRET aws (TYPE S3, PROVIDER credential_chain);")
 
+    src = f"read_parquet('{src_glob}', hive_partitioning=1)"
+
     # Fail loudly if the partition is empty/missing rather than publish a 0-row drop.
-    (row_count,) = con.execute(
-        "SELECT COUNT(*) FROM read_parquet(?, hive_partitioning=1)", [src_glob]
-    ).fetchone()
+    (row_count,) = con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()
     if row_count == 0:
         raise SystemExit(f"No rows found for {date} — refusing to publish an empty archive.")
 
-    # NOTE: inline src_glob (our own validated config — no injection vector) and
-    # keep a single `?` for the TO destination. DuckDB mis-binds COPY when both
-    # the subquery and the TO target use positional params.
+    # Build the column projection (cast obviously-integer fields to INT).
+    src_cols = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()]
+    proj = ", ".join(f"CAST({c} AS INTEGER) AS {c}" if c in _INT_FIELDS else c for c in src_cols)
+
+    # Adaptive thinning (adsb.lol trace style): keep a point when the aircraft does
+    # something real (turn/climb), at a state change, or at a heartbeat — otherwise
+    # drop redundant cruise points. Circular track diff handles the 0/360 wrap.
+    #
+    # Done as TWO PASSES so memory stays bounded on a small runner (prime directive):
+    #   Pass 1 windows over ONLY the ~8 decision columns (parquet column-projection
+    #          means S3 ships just those) -> the set of (hex, ts) keys to keep.
+    #   Pass 2 reads the full rows, keeps only those keys, sorts by (hex, ts).
+    # This avoids materialising all ~50 columns through the window/sort.
+    hb, turn, vert = _THIN_HEARTBEAT_S, _THIN_TURN_DEG, _THIN_VERT_FT
+    con.execute(f"""
+        CREATE TEMP TABLE _kept AS
+        WITH slim AS (
+            SELECT hex, ts, track, alt_baro, squawk, flight, is_snapshot, is_removed FROM {src}
+        ),
+        base AS (
+            SELECT *,
+                lag(track)    OVER w AS _p_trk,
+                lag(alt_baro) OVER w AS _p_alt,
+                lag(squawk)   OVER w AS _p_sq,
+                lag(flight)   OVER w AS _p_fl,
+                row_number()  OVER w AS _rn_first,
+                row_number()  OVER (PARTITION BY hex ORDER BY ts DESC) AS _rn_last,
+                row_number()  OVER (PARTITION BY hex, CAST(epoch(ts)/{hb} AS BIGINT) ORDER BY ts) AS _rn_hb
+            FROM slim WINDOW w AS (PARTITION BY hex ORDER BY ts)
+        )
+        SELECT DISTINCT hex, ts FROM base
+        WHERE _rn_first = 1 OR _rn_last = 1 OR _rn_hb = 1
+           OR LEAST(abs(track - _p_trk), 360 - abs(track - _p_trk)) >= {turn}
+           OR abs(alt_baro - _p_alt) >= {vert}
+           OR squawk IS DISTINCT FROM _p_sq
+           OR flight IS DISTINCT FROM _p_fl
+           OR is_snapshot OR is_removed
+    """)
+    # Pass 2: full rows for the chosen keys, sorted for compression locality.
+    # NOTE: inline src (our own validated config — no injection vector); single `?`
+    # for the TO destination (DuckDB mis-binds COPY with two positional params).
     con.execute(
-        f"""
-        COPY (
-            SELECT * FROM read_parquet('{src_glob}', hive_partitioning=1) ORDER BY ts
-        ) TO ? (FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE 1000000)
-        """,
+        f"COPY (SELECT {proj} FROM {src} WHERE (hex, ts) IN (SELECT hex, ts FROM _kept) "
+        f"ORDER BY hex, ts) TO ? "
+        "(FORMAT PARQUET, COMPRESSION zstd, COMPRESSION_LEVEL 6, ROW_GROUP_SIZE 1000000)",
         [out_parquet],
     )
+    con.execute("DROP TABLE _kept")
+    (kept_rows,) = con.execute("SELECT COUNT(*) FROM read_parquet(?)", [out_parquet]).fetchone()
 
     size = os.path.getsize(out_parquet)
     digest = _sha256(out_parquet)
@@ -110,21 +169,29 @@ def build(date: str, source_base: str, region: str, out_dir: str) -> dict:
     manifest = {
         "dataset": "adsbiq-aircraft-diffs",
         "date": date,
-        "rows": int(row_count),
+        "rows": int(kept_rows),
+        "raw_points": int(row_count),
         "file": os.path.basename(out_parquet),
         "bytes": size,
         "sha256": digest,
         "compression": "zstd",
         "source": "ADSBiq feeder network",
-        "schema_note": "append-only ADS-B aircraft state diffs; is_snapshot=true marks a full row, "
-                       "else only changed fields are populated. See repo README for column reference.",
+        "thinning": f"adaptive trace: a point is kept on a heading change >= {turn} deg, an "
+                    f"altitude change >= {vert} ft, a {hb}s heartbeat, or a state change "
+                    f"(squawk/callsign/snapshot/removal). Cruise collapses to the heartbeat; "
+                    f"turns and climbs stay full-detail.",
+        "schema_note": "append-only ADS-B aircraft state diffs, sorted by (hex, ts); is_snapshot=true "
+                       "marks a full row, else only changed fields are populated. lat/lon are degrees; "
+                       "alt/speed fields are integers. See repo README for column reference.",
         "license": "ODbL-1.0",
         "generated_by": "adsbiq daily_archive.py",
     }
     with open(out_manifest, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"[ok] {date}: {row_count:,} rows -> {out_parquet} ({size/1e6:.1f} MB, sha256={digest[:12]}...)")
+    pct = 100.0 * kept_rows / row_count if row_count else 0.0
+    print(f"[ok] {date}: {row_count:,} raw -> {kept_rows:,} kept ({pct:.1f}%) -> {out_parquet} "
+          f"({size/1e6:.1f} MB, sha256={digest[:12]}...)")
 
     # Emit machine-readable outputs for the GitHub Actions step.
     gh_out = os.environ.get("GITHUB_OUTPUT")
