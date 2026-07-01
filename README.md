@@ -1,5 +1,9 @@
 # ADSBiq history — daily ADS-B aircraft data
 
+[![Latest release](https://img.shields.io/github/v/release/Sky-Power-Services/adsbiq-data?display_name=tag&label=latest%20day&color=brightgreen)](https://github.com/Sky-Power-Services/adsbiq-data/releases/latest)
+[![Updated daily](https://img.shields.io/badge/updated-daily%20~00%3A30%20UTC-blue)](https://github.com/Sky-Power-Services/adsbiq-data/releases)
+[![License: ODbL-1.0](https://img.shields.io/badge/license-ODbL--1.0-lightgrey)](LICENSE)
+
 Free, open daily snapshots of aircraft seen by the [ADSBiq](https://adsbiq.com)
 feeder network. One [Release](../../releases) per UTC day, generated
 automatically. Inspired by [adsb.lol](https://github.com/adsblol)'s open-data
@@ -10,6 +14,22 @@ drops.
 |---|---|
 | `aircraft_diffs_<date>.parquet` | That day's ADS-B aircraft state, as append-only **diffs** (zstd Parquet) |
 | `manifest_<date>.json` | `rows`, `bytes`, `sha256`, schema note, license |
+
+## Latest — permanent download link
+
+The newest day is always at a fixed URL (no date needed):
+
+```bash
+curl -L -o aircraft_diffs_latest.parquet \n  https://github.com/Sky-Power-Services/adsbiq-data/releases/latest/download/aircraft_diffs_latest.parquet
+```
+
+Or query it in place — DuckDB reads the release URL directly:
+
+```sql
+SELECT * FROM 'https://github.com/Sky-Power-Services/adsbiq-data/releases/latest/download/aircraft_diffs_latest.parquet' LIMIT 10;
+```
+
+A committed **`sample.parquet`** (200 rows) at the repo root lets you peek at the schema without a download.
 
 ## Data model — append-only diffs
 Rows are time-ordered state changes, not full snapshots every tick (keeps files
@@ -48,6 +68,12 @@ duckdb.sql("SELECT hex, ts, lat, lon, alt_baro FROM 'aircraft_diffs_2026-06-27.p
 import pandas as pd
 df = pd.read_parquet("aircraft_diffs_2026-06-27.parquet")
 ```
+
+## Related
+
+- [vdliq-data](https://github.com/Sky-Power-Services/vdliq-data) — VDL2/ACARS datalink message data
+- [adsbiq-feeder](https://github.com/adsbiq/adsbiq-feeder) — join the network: open-source feeder install scripts
+- [ADSBiq](https://adsbiq.com) · [become a feeder](https://adsbiq.com/join) · open data at [adsbiq.com/data](https://adsbiq.com/data)
 
 ## License
 Open Database License (**ODbL-1.0**). Attribution: "ADSBiq feeder network".
