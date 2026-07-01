@@ -64,6 +64,40 @@ def _valid_date(s: str) -> str:
     return s
 
 
+def _kept_sql(src_expr: str, hb: int, turn: float, vert: int) -> str:
+    """SQL that builds TEMP TABLE ``_kept`` = the (hex, ts) keys to retain under the
+    adaptive-thinning rule: keep the first/last point per aircraft, one point per
+    ``hb``-second heartbeat, any heading change >= ``turn`` deg (0/360-wrap aware),
+    any altitude change >= ``vert`` ft, and any state change (squawk / callsign /
+    snapshot / removal). Isolated from S3 so it can be unit-tested against a
+    synthetic table. ``src_expr`` is a trusted relation (our own config), not user
+    input — no injection surface."""
+    return f"""
+        CREATE TEMP TABLE _kept AS
+        WITH slim AS (
+            SELECT hex, ts, track, alt_baro, squawk, flight, is_snapshot, is_removed FROM {src_expr}
+        ),
+        base AS (
+            SELECT *,
+                lag(track)    OVER w AS _p_trk,
+                lag(alt_baro) OVER w AS _p_alt,
+                lag(squawk)   OVER w AS _p_sq,
+                lag(flight)   OVER w AS _p_fl,
+                row_number()  OVER w AS _rn_first,
+                row_number()  OVER (PARTITION BY hex ORDER BY ts DESC) AS _rn_last,
+                row_number()  OVER (PARTITION BY hex, CAST(epoch(ts)/{hb} AS BIGINT) ORDER BY ts) AS _rn_hb
+            FROM slim WINDOW w AS (PARTITION BY hex ORDER BY ts)
+        )
+        SELECT DISTINCT hex, ts FROM base
+        WHERE _rn_first = 1 OR _rn_last = 1 OR _rn_hb = 1
+           OR LEAST(abs(track - _p_trk), 360 - abs(track - _p_trk)) >= {turn}
+           OR abs(alt_baro - _p_alt) >= {vert}
+           OR squawk IS DISTINCT FROM _p_sq
+           OR flight IS DISTINCT FROM _p_fl
+           OR is_snapshot OR is_removed
+    """
+
+
 def _sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -131,30 +165,7 @@ def build(date: str, source_base: str, region: str, out_dir: str) -> dict:
     #   Pass 2 reads the full rows, keeps only those keys, sorts by (hex, ts).
     # This avoids materialising all ~50 columns through the window/sort.
     hb, turn, vert = _THIN_HEARTBEAT_S, _THIN_TURN_DEG, _THIN_VERT_FT
-    con.execute(f"""
-        CREATE TEMP TABLE _kept AS
-        WITH slim AS (
-            SELECT hex, ts, track, alt_baro, squawk, flight, is_snapshot, is_removed FROM {src}
-        ),
-        base AS (
-            SELECT *,
-                lag(track)    OVER w AS _p_trk,
-                lag(alt_baro) OVER w AS _p_alt,
-                lag(squawk)   OVER w AS _p_sq,
-                lag(flight)   OVER w AS _p_fl,
-                row_number()  OVER w AS _rn_first,
-                row_number()  OVER (PARTITION BY hex ORDER BY ts DESC) AS _rn_last,
-                row_number()  OVER (PARTITION BY hex, CAST(epoch(ts)/{hb} AS BIGINT) ORDER BY ts) AS _rn_hb
-            FROM slim WINDOW w AS (PARTITION BY hex ORDER BY ts)
-        )
-        SELECT DISTINCT hex, ts FROM base
-        WHERE _rn_first = 1 OR _rn_last = 1 OR _rn_hb = 1
-           OR LEAST(abs(track - _p_trk), 360 - abs(track - _p_trk)) >= {turn}
-           OR abs(alt_baro - _p_alt) >= {vert}
-           OR squawk IS DISTINCT FROM _p_sq
-           OR flight IS DISTINCT FROM _p_fl
-           OR is_snapshot OR is_removed
-    """)
+    con.execute(_kept_sql(src, hb, turn, vert))
     # Pass 2: full rows for the chosen keys, sorted for compression locality.
     # NOTE: inline src (our own validated config — no injection vector); single `?`
     # for the TO destination (DuckDB mis-binds COPY with two positional params).
