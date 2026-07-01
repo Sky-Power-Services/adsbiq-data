@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this dataset, please cite it as below."
+title: "ADSBiq open ADS-B aircraft data"
+type: dataset
+abstract: "Free daily open snapshots of ADS-B aircraft state (append-only diffs, adaptively thinned) from the ADSBiq community feeder network."
+authors:
+  - name: "ADSBiq feeder network"
+url: "https://adsbiq.com/data"
+repository-code: "https://github.com/Sky-Power-Services/adsbiq-data"
+license: "ODbL-1.0"
+keywords:
+  - ADS-B
+  - aviation
+  - aircraft
+  - flight tracking
+  - open data
